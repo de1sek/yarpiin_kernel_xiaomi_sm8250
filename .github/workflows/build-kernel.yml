@@ -1,3 +1,65 @@
+# .github/workflows/build-kernel.yml
+#
+# 适用仓库: yarpiin/kernel_xiaomi_sm8250 (分支 LA.UM.9.12.r1-XXXX-SMxx50.QSSI13.0)
+# 目标机型: thyme (Xiaomi Mi 10S / Redmi K30 Ultra)，SoC: Qualcomm SM8250 (kona)
+#
+# 本文件里的每一个关键决策都能在该内核源码所属的家族里找到实证依据，
+# 而不是凭经验瞎猜某个通用安卓内核该怎么编：
+#
+#  1) 该仓库是一份【非 GKI / 老式 CAF】的 Linux 4.19 单体内核（顶层仍是
+#     Documentation/arch/.../techpack/Makefile/Kconfig 这种传统结构，
+#     没有 build.config.* / Kleaf，所以不能按 GKI 内核的流程来编）。
+#  2) 内核树里 arch/arm64/configs 下按机型放 defconfig（同宗的
+#     xiaomi-sm8250-devs/android_kernel_xiaomi_sm8250 仓库提交记录里能看到
+#     alioth/apollo/cas/cmi/lmi/thyme/umi 各自的 *_defconfig，thyme 就是
+#     Mi 10S 对应的机型代号）。不同 fork 里这个文件有的在
+#     arch/arm64/configs/vendor/ 下，有的被拍平到 arch/arm64/configs/ 根目录，
+#     所以工作流里用 find 动态定位，不写死路径。
+#  3) 对应的设备树（device_xiaomi_sm8250_common, EvolutionX_OSS 分支）里
+#     BoardConfigCommon.mk 写明：
+#       TARGET_KERNEL_CLANG_COMPILE := true
+#       BOARD_KERNEL_SEPARATED_DTBO := true
+#       BOARD_INCLUDE_DTB_IN_BOOTIMG := true
+#     即内核用 Clang 编译，且 dtb / dtbo 是分开产出的。
+#  4) 同一份 sm8250 内核家族（UtsavBalar1231 / liyafe1997 / yspbwx2010 等
+#     fork，均可追溯到与 yarpiin 相同的上游）里实际可用、已验证跑通的
+#     build.sh 用的是：
+#       - Proton Clang（自带 clang + aarch64-linux-gnu-*/arm-linux-gnueabi-*
+#         binutils，不需要再单独拉 GCC 4.9）
+#       - MAKE 参数: ARCH=arm64 SUBARCH=arm64 CC=clang
+#         CROSS_COMPILE=aarch64-linux-gnu-
+#         CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+#         CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+#         CLANG_TRIPLE=aarch64-linux-gnu-
+#     本工作流原样沿用这一套，而不是随便找个 clang 版本硬套。
+#  5) 按你的要求，这版只产出 arch/arm64/boot/Image 和 Image.gz 两个文件，
+#     不做 dtb 合并、不打 dtbo、不套 AnyKernel3、不压 zip。
+#     Image.gz 是 arch/arm64/boot/Makefile 里 Image 的下游目标（gzip 压缩
+#     版本），直接把它作为 make 目标即可，kbuild 会自动先编出 Image 再压缩，
+#     不需要额外工具。
+#  6) 上一版实际编译报错：
+#       /opt/proton-clang/bin/as: unrecognized option '-EL'
+#       clang-13: error: assembler command failed with exit code 1
+#       make[1]: *** [arch/arm64/Makefile:202: vdso_prepare] Error 2
+#     根因是内核自带的 arch/arm64/kernel/vdso32/Makefile 太老（2019 年的
+#     CAF 代码），而 Proton Clang 是新版 LLVM（clang-13）。新版 clang 对
+#     "--prefix=" 参数的查找逻辑变了：老 Makefile 期望 clang 去找
+#     "$(COMPAT_GCC_TOOLCHAIN_DIR)$(CROSS_COMPILE_COMPAT)as"（即
+#     arm-linux-gnueabi-as），但新版 clang 只会去找
+#     "$(COMPAT_GCC_TOOLCHAIN_DIR)as"（不带前缀的裸 as），于是它找到了
+#     proton-clang/bin 目录下那个不认识 "-EL" 参数的 as，导致 32 位 vdso
+#     编译失败。这是上游内核官方已确认并修复过的 bug（commit
+#     7b7891c7bdfd61fc9ed6747a0a05efe2394dddc6，后来还被反向 backport 进
+#     5.7 稳定版），只是这份 msm-4.19 下游内核太老，没有这个补丁。
+#     修复方式就是上游那个 commit 本身的一行改动，工作流里用 sed 原样打上：
+#       --prefix=$(COMPAT_GCC_TOOLCHAIN_DIR)
+#       -> --prefix=$(COMPAT_GCC_TOOLCHAIN_DIR)$(notdir $(CROSS_COMPILE_COMPAT))
+#     不是瞎改的绕过手段，是把内核缺的那个官方补丁行为原样补上。
+#
+# 使用前只需确认一件事：仓库里 thyme 的 defconfig 确实存在
+# （工作流会自动搜索，如果没搜到会直接报错并列出所有可用 defconfig，
+#  不会假装编译成功）。
+
 name: Build Kernel (thyme / Mi 10S / SM8250)
 
 on:
@@ -112,6 +174,16 @@ jobs:
         if: ${{ env.KERNELSU == 'true' }}
         run: |
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+
+      - name: 修补 vdso32 --prefix=（新版 Clang 兼容性修复）
+        run: |
+          F="arch/arm64/kernel/vdso32/Makefile"
+          if grep -qF -- '--prefix=$(COMPAT_GCC_TOOLCHAIN_DIR)$(notdir' "$F"; then
+            echo "已经是修复过的版本，跳过。"
+          else
+            sed -i 's/--prefix=\$(COMPAT_GCC_TOOLCHAIN_DIR)$/--prefix=$(COMPAT_GCC_TOOLCHAIN_DIR)$(notdir $(CROSS_COMPILE_COMPAT))/' "$F"
+            grep -n -- '--prefix=' "$F"
+          fi
 
       - name: 生成 .config
         run: |
