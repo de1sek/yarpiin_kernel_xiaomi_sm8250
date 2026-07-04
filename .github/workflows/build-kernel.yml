@@ -1,0 +1,188 @@
+name: Build Kernel (thyme / Mi 10S / SM8250)
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: '目标机型 defconfig 名（Mi 10S 对应代号）'
+        required: true
+        default: 'thyme'
+      kernelsu:
+        description: '是否集成 KernelSU'
+        type: boolean
+        required: false
+        default: false
+      localversion:
+        description: '追加到内核版本号末尾的自定义后缀，可留空'
+        required: false
+        default: ''
+  push:
+    branches:
+      - 'LA.UM.9.12.r1-XXXX-SMxx50.QSSI13.0'
+
+concurrency:
+  group: kernel-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEVICE: ${{ github.event.inputs.device || 'thyme' }}
+  KERNELSU: ${{ github.event.inputs.kernelsu || 'false' }}
+  LOCALVERSION: ${{ github.event.inputs.localversion || '' }}
+  OUT_DIR: out
+  CLANG_DIR: /opt/proton-clang
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 释放构建机磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          df -h
+
+      - name: 检出内核源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev \
+            build-essential kmod cpio rsync \
+            git curl ca-certificates \
+            python3 python-is-python3 ccache
+
+      - name: 缓存 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.DEVICE }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ env.DEVICE }}-
+
+      - name: 缓存 Proton Clang 工具链
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CLANG_DIR }}
+          key: proton-clang-master
+
+      - name: 拉取 Proton Clang（含 clang + aarch64/arm binutils）
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git "${{ env.CLANG_DIR }}"
+
+      - name: 注册工具链到 PATH 并校验
+        run: |
+          echo "${{ env.CLANG_DIR }}/bin" >> "$GITHUB_PATH"
+          export PATH="${{ env.CLANG_DIR }}/bin:$PATH"
+          echo "== clang --version =="
+          clang --version
+          echo "== aarch64-linux-gnu-ld --version =="
+          aarch64-linux-gnu-ld --version | head -n1
+          echo "== arm-linux-gnueabi-ld --version =="
+          arm-linux-gnueabi-ld --version | head -n1
+
+      - name: 定位 ${{ env.DEVICE }} 的 defconfig（自动搜索，不写死路径）
+        id: defconfig
+        run: |
+          FOUND="$(find arch/arm64/configs -type f -name "${DEVICE}_defconfig" | head -n1)"
+          if [ -z "$FOUND" ]; then
+            echo "::error::在 arch/arm64/configs 下没有找到 ${DEVICE}_defconfig。"
+            echo "该分支下实际存在的 defconfig 有："
+            find arch/arm64/configs -type f -name "*_defconfig"
+            exit 1
+          fi
+          RELCFG="$(realpath --relative-to=arch/arm64/configs "$FOUND")"
+          echo "命中: $FOUND  ->  make 目标名: $RELCFG"
+          echo "path=$FOUND"   >> "$GITHUB_OUTPUT"
+          echo "target=$RELCFG" >> "$GITHUB_OUTPUT"
+
+      - name: 追加自定义 LOCALVERSION（可选）
+        if: ${{ env.LOCALVERSION != '' }}
+        run: |
+          echo 'CONFIG_LOCALVERSION="-${{ env.LOCALVERSION }}"' >> "${{ steps.defconfig.outputs.path }}"
+
+      - name: 集成 KernelSU（可选，需在生成 .config 之前注入源码树）
+        if: ${{ env.KERNELSU == 'true' }}
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+
+      - name: 生成 .config
+        run: |
+          export PATH="${{ env.CLANG_DIR }}/bin:$PATH"
+          make -j"$(nproc --all)" \
+            ARCH=arm64 SUBARCH=arm64 O=${{ env.OUT_DIR }} \
+            CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            ${{ steps.defconfig.outputs.target }}
+
+      - name: 若启用 KernelSU，则在 .config 中打开对应选项
+        if: ${{ env.KERNELSU == 'true' }}
+        run: |
+          export PATH="${{ env.CLANG_DIR }}/bin:$PATH"
+          scripts/config --file ${{ env.OUT_DIR }}/.config -e KSU
+          make -j"$(nproc --all)" \
+            ARCH=arm64 SUBARCH=arm64 O=${{ env.OUT_DIR }} \
+            CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            olddefconfig
+
+      - name: 编译内核（目标 Image.gz，会连带生成 Image）
+        run: |
+          export PATH="${{ env.CLANG_DIR }}/bin:$PATH"
+          set -o pipefail
+          make -j"$(nproc --all)" \
+            ARCH=arm64 SUBARCH=arm64 O=${{ env.OUT_DIR }} \
+            CC="ccache clang" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            Image.gz \
+            2>&1 | tee build.log
+
+      - name: 校验产物
+        run: |
+          IMG="${{ env.OUT_DIR }}/arch/arm64/boot/Image"
+          IMGGZ="${{ env.OUT_DIR }}/arch/arm64/boot/Image.gz"
+          if [ ! -f "$IMG" ] || [ ! -f "$IMGGZ" ]; then
+            echo "::error::Image / Image.gz 没有同时生成，编译失败，请查看 build-log 这份 artifact 排错。"
+            ls -la ${{ env.OUT_DIR }}/arch/arm64/boot/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "已生成:"
+          ls -la "$IMG" "$IMGGZ"
+
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.DEVICE }}
+          path: build.log
+          retention-days: 7
+
+      - name: 上传 Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-${{ env.DEVICE }}
+          path: ${{ env.OUT_DIR }}/arch/arm64/boot/Image
+          retention-days: 14
+
+      - name: 上传 Image.gz
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image.gz-${{ env.DEVICE }}
+          path: ${{ env.OUT_DIR }}/arch/arm64/boot/Image.gz
+          retention-days: 14
