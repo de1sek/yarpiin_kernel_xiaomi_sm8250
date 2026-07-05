@@ -46,7 +46,6 @@ jobs:
                       /opt/hostedtoolcache/CodeQL 2>/dev/null || true
           sudo docker image prune -af 2>/dev/null || true
           df -h
-
       - name: 检出内核源码
         uses: actions/checkout@v4
         with:
@@ -61,7 +60,6 @@ jobs:
             build-essential kmod cpio rsync \
             git curl ca-certificates \
             python3 python-is-python3 ccache
-
       - name: 缓存 ccache
         uses: actions/cache@v4
         with:
@@ -69,7 +67,6 @@ jobs:
           key: ccache-${{ env.DEVICE }}-${{ github.sha }}
           restore-keys: |
             ccache-${{ env.DEVICE }}-
-
       # 改动2：缓存 key 换成新工具链的标识，避免复用到 proton-clang 时代的缓存
       - name: 缓存官方 Clang 工具链
         id: clang-cache
@@ -85,7 +82,6 @@ jobs:
           git clone --depth=1 -b master-kernel-build-2021 \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
             "${{ env.CLANG_DIR }}"
-
       - name: 缓存官方 GNU as 兜底工具
         id: gas-cache
         uses: actions/cache@v4
@@ -99,12 +95,16 @@ jobs:
           git clone --depth=1 \
             https://android.googlesource.com/platform/prebuilts/gas/linux-x86 \
             "${{ env.GAS_DIR }}" || echo "::warning::gas 兜底工具拉取失败，不影响主流程，继续执行"
-
+      # 改动6（方案A）：prebuilts/gas/linux-x86 这个仓库的二进制是直接放在仓库根目录的
+      # （aarch64-linux-gnu-as / arm-linux-gnueabi-as 等），没有 bin/ 这一层子目录。
+      # 之前写的是 ${GAS_DIR}/bin，这个路径根本不存在，导致官方 as 从未被真正加进过 PATH，
+      # clang 找不到 aarch64-linux-gnu-as 才退而抓到系统自带的 /usr/bin/as，
+      # 报 "unrecognized option '-EL'"。现在改成直接把 ${GAS_DIR} 本身加进 PATH。
       - name: 注册工具链到 PATH 并校验
         run: |
           echo "${{ env.CLANG_DIR }}/bin" >> "$GITHUB_PATH"
-          echo "${{ env.GAS_DIR }}/bin" >> "$GITHUB_PATH"
-          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}/bin:$PATH"
+          echo "${{ env.GAS_DIR }}" >> "$GITHUB_PATH"
+          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}:$PATH"
           echo "== clang --version =="
           clang --version
           echo "== 校验是否命中 r399163b（如果没匹配到，说明拉取到的不是预期版本，请手动确认分支/commit）=="
@@ -112,7 +112,10 @@ jobs:
             || echo "::warning::clang --version 输出里没找到 399163 字样，请人工确认这份 clang 是否确实对应官方 build.config.common 里指定的版本"
           echo "== ld.lld --version（改用 LLVM 自带链接器，不再依赖 proton-clang 自带的 GNU ld）=="
           ld.lld --version || echo "::warning::ld.lld 不存在，检查 clang 包内是否包含 lld"
-
+          echo "== aarch64-linux-gnu-as --version（来自 prebuilts/gas/linux-x86，路径已修正）=="
+          aarch64-linux-gnu-as --version | head -n1
+          echo "== arm-linux-gnueabi-as --version（32位兼容部分用的交叉汇编器）=="
+          arm-linux-gnueabi-as --version | head -n1
       - name: 定位 ${{ env.DEVICE }} 的 defconfig（自动搜索，不写死路径）
         id: defconfig
         run: |
@@ -127,17 +130,14 @@ jobs:
           echo "命中: $FOUND  ->  make 目标名: $RELCFG"
           echo "path=$FOUND"   >> "$GITHUB_OUTPUT"
           echo "target=$RELCFG" >> "$GITHUB_OUTPUT"
-
       - name: 追加自定义 LOCALVERSION（默认非空，避免版本号和官方固件撞车）
         if: ${{ env.LOCALVERSION != '' }}
         run: |
           echo 'CONFIG_LOCALVERSION="-${{ env.LOCALVERSION }}"' >> "${{ steps.defconfig.outputs.path }}"
-
       - name: 集成 KernelSU（可选，需在生成 .config 之前注入源码树）
         if: ${{ env.KERNELSU == 'true' }}
         run: |
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
-
       # 改动4：这一步是专门为兼容 proton-clang 之类的新版第三方 clang 打的补丁。
       # 换回官方 clang-r399163b 后大概率不再需要，但保留这一步是安全的——
       # 它会先检测 Makefile 是否已经是"修复过的写法"，命中就跳过，不会重复打坏。
@@ -150,13 +150,13 @@ jobs:
             sed -i 's/--prefix=\$(COMPAT_GCC_TOOLCHAIN_DIR)$/--prefix=$(COMPAT_GCC_TOOLCHAIN_DIR)$(notdir $(CROSS_COMPILE_COMPAT))/' "$F"
             grep -n -- '--prefix=' "$F"
           fi
-
       # 改动5：make 命令里加上 LD/AR/NM/OBJCOPY/OBJDUMP/STRIP 显式指向 LLVM 自带工具，
       # 而不是让 CROSS_COMPILE 前缀去找 PATH 里第一个同名的 GNU 工具（那样很容易又混进第三方 binutils）。
-      # 注：已经确认这份内核 4.19 的顶层 Makefile 不支持 LLVM=1 这个新式开关，所以继续用显式变量的老写法。
+      # AS 没有显式指定，走 CROSS_COMPILE 前缀，现在 PATH 里能正确找到 prebuilts/gas/linux-x86 提供的
+      # aarch64-linux-gnu-as / arm-linux-gnueabi-as 了。
       - name: 生成 .config
         run: |
-          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}/bin:$PATH"
+          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}:$PATH"
           make -j"$(nproc --all)" \
             ARCH=arm64 SUBARCH=arm64 O=${{ env.OUT_DIR }} \
             CC="ccache clang" \
@@ -171,11 +171,10 @@ jobs:
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             ${{ steps.defconfig.outputs.target }}
-
       - name: 若启用 KernelSU，则在 .config 中打开对应选项
         if: ${{ env.KERNELSU == 'true' }}
         run: |
-          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}/bin:$PATH"
+          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}:$PATH"
           scripts/config --file ${{ env.OUT_DIR }}/.config -e KSU
           make -j"$(nproc --all)" \
             ARCH=arm64 SUBARCH=arm64 O=${{ env.OUT_DIR }} \
@@ -191,10 +190,9 @@ jobs:
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             olddefconfig
-
       - name: 编译内核（目标 Image.gz，会连带生成 Image）
         run: |
-          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}/bin:$PATH"
+          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}:$PATH"
           set -o pipefail
           make -j"$(nproc --all)" \
             ARCH=arm64 SUBARCH=arm64 O=${{ env.OUT_DIR }} \
@@ -211,7 +209,6 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             Image.gz \
             2>&1 | tee build.log
-
       - name: 校验产物
         run: |
           IMG="${{ env.OUT_DIR }}/arch/arm64/boot/Image"
@@ -223,7 +220,6 @@ jobs:
           fi
           echo "已生成:"
           ls -la "$IMG" "$IMGGZ"
-
       - name: 上传编译日志
         if: always()
         uses: actions/upload-artifact@v4
