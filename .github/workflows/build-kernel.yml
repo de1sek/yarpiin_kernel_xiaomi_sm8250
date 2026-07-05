@@ -65,7 +65,16 @@ jobs:
             bc bison flex libssl-dev libelf-dev \
             build-essential kmod cpio rsync \
             git curl ca-certificates \
-            python3 python-is-python3 ccache
+            python3 python-is-python3 ccache \
+            binutils-arm-linux-gnueabi
+          # 说明：binutils-arm-linux-gnueabi 是专门为了补上 arm-linux-gnueabi-ld。
+          # 内核编译 32 位兼容 vDSO（vdso32）那一步是 Makefile 里硬编码直接调用
+          # $(CROSS_COMPILE_ARM32)ld（即 arm-linux-gnueabi-ld），不走我们 make 时
+          # 显式指定的 LD=ld.lld。而我们目前用的两套官方工具链里都没有这个文件：
+          # prebuilts/gas/linux-x86 官方 README 写明该仓库只含 as 和 elfedit，
+          # 没有 ld；官方 clang 包自带的也只是 ld.lld，不是这个交叉版 GNU ld。
+          # 所以这里用 apt 装一个真正的 GNU binutils 来补这一个缺口，
+          # 其余的 AR/NM/OBJCOPY/OBJDUMP/STRIP 仍然显式指向 LLVM 工具，不受影响。
       - name: 缓存 ccache
         uses: actions/cache@v4
         with:
@@ -149,6 +158,8 @@ jobs:
           aarch64-linux-gnu-as --version | head -n1
           echo "== arm-linux-gnueabi-as --version（32位兼容部分用的交叉汇编器）=="
           arm-linux-gnueabi-as --version | head -n1
+          echo "== arm-linux-gnueabi-ld --version（vdso32 链接阶段硬编码调用，来自 apt 装的 binutils-arm-linux-gnueabi，不是官方两套工具链里的东西）=="
+          arm-linux-gnueabi-ld --version | head -n1 || { echo "::error::arm-linux-gnueabi-ld 不存在，检查 binutils-arm-linux-gnueabi 是否装成功"; exit 1; }
       - name: 定位 ${{ env.DEVICE }} 的 defconfig（自动搜索，不写死路径）
         id: defconfig
         run: |
