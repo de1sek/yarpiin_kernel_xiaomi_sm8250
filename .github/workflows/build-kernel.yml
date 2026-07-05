@@ -34,6 +34,12 @@ env:
   # build.config.common 里写死的是 clang-r399163b；
   # master-kernel-build-2021 分支是 Google 官方仓库里专门给这个时期内核构建用的分支。
   CLANG_DIR: /opt/clang-official
+  # prebuilts/clang/host/linux-x86 这个仓库在 master-kernel-build-2021 分支下
+  # 同时塞了好几个版本（clang-r399163b / clang-r416183b / clang-r416183c /
+  # clang-r383902 / clang-stable / clang-3289846……），必须显式指定要用哪一个，
+  # 不能靠 find 随便搜到一个就用——那样命中哪个版本是不确定的。
+  # 这里对应 build.config.common 里写死的 clang-r399163b。
+  CLANG_VERSION: clang-r399163b
   GAS_DIR: /opt/gas-official
 
 jobs:
@@ -84,26 +90,26 @@ jobs:
             "${{ env.CLANG_DIR }}"
 
       # 修复关键点：prebuilts/clang/host/linux-x86 这个仓库是按版本号分子目录存放的
-      # （例如 clang-r399163b/bin/clang），克隆下来的根目录本身没有 bin/ 这一层。
-      # 之前直接把 $CLANG_DIR/bin 塞进 PATH 是一个不存在的路径，等于没生效，
-      # 导致 which clang 落到了 ubuntu-22.04 runner 自带的系统 clang-14 上
-      # （表现为 clang --version 输出 "Ubuntu clang version 14.0.0"、
-      # InstalledDir: /usr/bin，且找不到 ld.lld / llvm-objdump，
-      # 最终在编译 vdso 时报 "ld.lld: not found" Error 127）。
+      # （例如 clang-r399163b/bin/clang），克隆下来的根目录本身没有 bin/ 这一层，
+      # 而且 master-kernel-build-2021 这个分支下同时存在好几个版本目录
+      # （clang-r399163b、clang-r416183b、clang-r416183c、clang-r383902、
+      # clang-stable、clang-3289846……）。
+      # 之前用 find + head -n1 去猜路径，一是 -maxdepth 2 不够深（bin/clang 文件
+      # 本身在第 3 层，永远搜不到），二是就算深度改对了，多个版本目录同时存在时
+      # 猜中哪个版本也是不确定的。这里改成直接拼接 CLANG_VERSION 指定的路径，
+      # 再校验它是否真的存在，确定性更强，出错报的信息也更明确。
       # 这一步不依赖 cache-hit 条件，无论是刚拉取还是命中缓存都会执行，
-      # 动态找出真正的 bin 目录并写入 GITHUB_ENV，后面统一引用 $CLANG_BIN_DIR。
+      # 结果写入 GITHUB_ENV，后面统一引用 $CLANG_BIN_DIR。
       - name: 定位官方 Clang 实际的 bin 目录
         run: |
-          CLANG_BIN="$(find "${{ env.CLANG_DIR }}" -maxdepth 2 -type f -name clang -path '*/bin/clang' | head -n1)"
-          if [ -z "$CLANG_BIN" ]; then
-            echo "::error::在 ${{ env.CLANG_DIR }} 下没有找到任何 */bin/clang，克隆可能失败或分支目录结构变了。"
-            echo "当前目录结构（2层）："
-            find "${{ env.CLANG_DIR }}" -maxdepth 2 -type d
+          CLANG_BIN_DIR="${{ env.CLANG_DIR }}/${{ env.CLANG_VERSION }}/bin"
+          if [ ! -x "$CLANG_BIN_DIR/clang" ]; then
+            echo "::error::没有找到 $CLANG_BIN_DIR/clang。CLANG_VERSION=${{ env.CLANG_VERSION }} 这个版本目录在当前分支下可能不存在了。"
+            echo "该分支下实际存在的版本目录有："
+            find "${{ env.CLANG_DIR }}" -maxdepth 1 -type d -name 'clang-*'
             exit 1
           fi
-          CLANG_BIN_DIR="$(dirname "$CLANG_BIN")"
-          echo "命中 clang 实际路径: $CLANG_BIN"
-          echo "对应 bin 目录: $CLANG_BIN_DIR"
+          echo "使用: $CLANG_BIN_DIR"
           echo "CLANG_BIN_DIR=$CLANG_BIN_DIR" >> "$GITHUB_ENV"
 
       - name: 缓存官方 GNU as 兜底工具
