@@ -30,7 +30,7 @@ env:
   KERNELSU: ${{ github.event.inputs.kernelsu || 'false' }}
   LOCALVERSION: ${{ github.event.inputs.localversion || 'selfbuild' }}
   OUT_DIR: out
-  # 改动1：不再用 proton-clang，改用官方 AOSP 内核构建用的 clang 快照。
+  # 不再用 proton-clang，改用官方 AOSP 内核构建用的 clang 快照。
   # build.config.common 里写死的是 clang-r399163b；
   # master-kernel-build-2021 分支是 Google 官方仓库里专门给这个时期内核构建用的分支。
   CLANG_DIR: /opt/clang-official
@@ -67,7 +67,7 @@ jobs:
           key: ccache-${{ env.DEVICE }}-${{ github.sha }}
           restore-keys: |
             ccache-${{ env.DEVICE }}-
-      # 改动2：缓存 key 换成新工具链的标识，避免复用到 proton-clang 时代的缓存
+      # 缓存 key 换成新工具链的标识，避免复用到 proton-clang 时代的缓存
       - name: 缓存官方 Clang 工具链
         id: clang-cache
         uses: actions/cache@v4
@@ -75,13 +75,37 @@ jobs:
           path: ${{ env.CLANG_DIR }}
           key: official-clang-r399163b-v1
 
-      # 改动3：把拉取源从 kdrag0n/proton-clang 换成 Google 官方仓库的 master-kernel-build-2021 分支
+      # 把拉取源从 kdrag0n/proton-clang 换成 Google 官方仓库的 master-kernel-build-2021 分支
       - name: 拉取官方 Clang（clang-r399163b，master-kernel-build-2021 分支）
         if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth=1 -b master-kernel-build-2021 \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
             "${{ env.CLANG_DIR }}"
+
+      # 修复关键点：prebuilts/clang/host/linux-x86 这个仓库是按版本号分子目录存放的
+      # （例如 clang-r399163b/bin/clang），克隆下来的根目录本身没有 bin/ 这一层。
+      # 之前直接把 $CLANG_DIR/bin 塞进 PATH 是一个不存在的路径，等于没生效，
+      # 导致 which clang 落到了 ubuntu-22.04 runner 自带的系统 clang-14 上
+      # （表现为 clang --version 输出 "Ubuntu clang version 14.0.0"、
+      # InstalledDir: /usr/bin，且找不到 ld.lld / llvm-objdump，
+      # 最终在编译 vdso 时报 "ld.lld: not found" Error 127）。
+      # 这一步不依赖 cache-hit 条件，无论是刚拉取还是命中缓存都会执行，
+      # 动态找出真正的 bin 目录并写入 GITHUB_ENV，后面统一引用 $CLANG_BIN_DIR。
+      - name: 定位官方 Clang 实际的 bin 目录
+        run: |
+          CLANG_BIN="$(find "${{ env.CLANG_DIR }}" -maxdepth 2 -type f -name clang -path '*/bin/clang' | head -n1)"
+          if [ -z "$CLANG_BIN" ]; then
+            echo "::error::在 ${{ env.CLANG_DIR }} 下没有找到任何 */bin/clang，克隆可能失败或分支目录结构变了。"
+            echo "当前目录结构（2层）："
+            find "${{ env.CLANG_DIR }}" -maxdepth 2 -type d
+            exit 1
+          fi
+          CLANG_BIN_DIR="$(dirname "$CLANG_BIN")"
+          echo "命中 clang 实际路径: $CLANG_BIN"
+          echo "对应 bin 目录: $CLANG_BIN_DIR"
+          echo "CLANG_BIN_DIR=$CLANG_BIN_DIR" >> "$GITHUB_ENV"
+
       - name: 缓存官方 GNU as 兜底工具
         id: gas-cache
         uses: actions/cache@v4
@@ -95,23 +119,26 @@ jobs:
           git clone --depth=1 \
             https://android.googlesource.com/platform/prebuilts/gas/linux-x86 \
             "${{ env.GAS_DIR }}" || echo "::warning::gas 兜底工具拉取失败，不影响主流程，继续执行"
-      # 改动6（方案A）：prebuilts/gas/linux-x86 这个仓库的二进制是直接放在仓库根目录的
-      # （aarch64-linux-gnu-as / arm-linux-gnueabi-as 等），没有 bin/ 这一层子目录。
-      # 之前写的是 ${GAS_DIR}/bin，这个路径根本不存在，导致官方 as 从未被真正加进过 PATH，
-      # clang 找不到 aarch64-linux-gnu-as 才退而抓到系统自带的 /usr/bin/as，
-      # 报 "unrecognized option '-EL'"。现在改成直接把 ${GAS_DIR} 本身加进 PATH。
+      # prebuilts/gas/linux-x86 这个仓库的二进制是直接放在仓库根目录的
+      # （aarch64-linux-gnu-as / arm-linux-gnueabi-as 等），没有 bin/ 这一层子目录，
+      # 和 clang 仓库的结构不一样，这里直接把 $GAS_DIR 本身加进 PATH 即可，
+      # 日志已验证这部分是正常工作的。
       - name: 注册工具链到 PATH 并校验
         run: |
-          echo "${{ env.CLANG_DIR }}/bin" >> "$GITHUB_PATH"
+          echo "$CLANG_BIN_DIR" >> "$GITHUB_PATH"
           echo "${{ env.GAS_DIR }}" >> "$GITHUB_PATH"
-          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}:$PATH"
+          export PATH="$CLANG_BIN_DIR:${{ env.GAS_DIR }}:$PATH"
+          echo "== 使用的 clang 路径 =="
+          which clang
           echo "== clang --version =="
           clang --version
-          echo "== 校验是否命中 r399163b（如果没匹配到，说明拉取到的不是预期版本，请手动确认分支/commit）=="
+          echo "== 校验是否命中 r399163b（如果没匹配到，说明用错了 clang，直接失败而不是继续跑）=="
           clang --version | grep -q "399163" && echo "OK: 版本匹配 clang-r399163b" \
-            || echo "::warning::clang --version 输出里没找到 399163 字样，请人工确认这份 clang 是否确实对应官方 build.config.common 里指定的版本"
+            || { echo "::error::clang --version 输出里没找到 399163 字样，说明 PATH 没有正确指向官方 clang（很可能又落到系统自带的 clang 了），停止构建。"; exit 1; }
           echo "== ld.lld --version（改用 LLVM 自带链接器，不再依赖 proton-clang 自带的 GNU ld）=="
-          ld.lld --version || echo "::warning::ld.lld 不存在，检查 clang 包内是否包含 lld"
+          ld.lld --version || { echo "::error::ld.lld 不存在，检查 CLANG_BIN_DIR 是否指向正确的官方 clang bin 目录"; exit 1; }
+          echo "== llvm-objdump --version =="
+          llvm-objdump --version || { echo "::error::llvm-objdump 不存在，检查 CLANG_BIN_DIR 是否指向正确的官方 clang bin 目录"; exit 1; }
           echo "== aarch64-linux-gnu-as --version（来自 prebuilts/gas/linux-x86，路径已修正）=="
           aarch64-linux-gnu-as --version | head -n1
           echo "== arm-linux-gnueabi-as --version（32位兼容部分用的交叉汇编器）=="
@@ -138,7 +165,7 @@ jobs:
         if: ${{ env.KERNELSU == 'true' }}
         run: |
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
-      # 改动4：这一步是专门为兼容 proton-clang 之类的新版第三方 clang 打的补丁。
+      # 这一步是专门为兼容 proton-clang 之类的新版第三方 clang 打的补丁。
       # 换回官方 clang-r399163b 后大概率不再需要，但保留这一步是安全的——
       # 它会先检测 Makefile 是否已经是"修复过的写法"，命中就跳过，不会重复打坏。
       - name: 修补 vdso32 --prefix=（仅在需要时生效，用官方工具链一般会被跳过）
@@ -150,13 +177,13 @@ jobs:
             sed -i 's/--prefix=\$(COMPAT_GCC_TOOLCHAIN_DIR)$/--prefix=$(COMPAT_GCC_TOOLCHAIN_DIR)$(notdir $(CROSS_COMPILE_COMPAT))/' "$F"
             grep -n -- '--prefix=' "$F"
           fi
-      # 改动5：make 命令里加上 LD/AR/NM/OBJCOPY/OBJDUMP/STRIP 显式指向 LLVM 自带工具，
+      # make 命令里加上 LD/AR/NM/OBJCOPY/OBJDUMP/STRIP 显式指向 LLVM 自带工具，
       # 而不是让 CROSS_COMPILE 前缀去找 PATH 里第一个同名的 GNU 工具（那样很容易又混进第三方 binutils）。
-      # AS 没有显式指定，走 CROSS_COMPILE 前缀，现在 PATH 里能正确找到 prebuilts/gas/linux-x86 提供的
-      # aarch64-linux-gnu-as / arm-linux-gnueabi-as 了。
+      # AS 没有显式指定，走 CROSS_COMPILE 前缀，PATH 里能正确找到 prebuilts/gas/linux-x86 提供的
+      # aarch64-linux-gnu-as / arm-linux-gnueabi-as。
       - name: 生成 .config
         run: |
-          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}:$PATH"
+          export PATH="$CLANG_BIN_DIR:${{ env.GAS_DIR }}:$PATH"
           make -j"$(nproc --all)" \
             ARCH=arm64 SUBARCH=arm64 O=${{ env.OUT_DIR }} \
             CC="ccache clang" \
@@ -174,7 +201,7 @@ jobs:
       - name: 若启用 KernelSU，则在 .config 中打开对应选项
         if: ${{ env.KERNELSU == 'true' }}
         run: |
-          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}:$PATH"
+          export PATH="$CLANG_BIN_DIR:${{ env.GAS_DIR }}:$PATH"
           scripts/config --file ${{ env.OUT_DIR }}/.config -e KSU
           make -j"$(nproc --all)" \
             ARCH=arm64 SUBARCH=arm64 O=${{ env.OUT_DIR }} \
@@ -192,7 +219,7 @@ jobs:
             olddefconfig
       - name: 编译内核（目标 Image.gz，会连带生成 Image）
         run: |
-          export PATH="${{ env.CLANG_DIR }}/bin:${{ env.GAS_DIR }}:$PATH"
+          export PATH="$CLANG_BIN_DIR:${{ env.GAS_DIR }}:$PATH"
           set -o pipefail
           make -j"$(nproc --all)" \
             ARCH=arm64 SUBARCH=arm64 O=${{ env.OUT_DIR }} \
