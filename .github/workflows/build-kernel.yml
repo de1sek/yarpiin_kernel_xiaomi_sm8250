@@ -1,4 +1,4 @@
-name: Build Kernel (thyme / Mi 10S / SM8250)
+name: Build Kernel (thyme / Mi 10S / SM8250, NotZeetaa CAF_MSM)
 
 on:
   workflow_dispatch:
@@ -19,7 +19,11 @@ on:
 
   push:
     branches:
-      - 'LA.UM.9.12.r1-XXXX-SMxx50.QSSI13.0'
+      - 'CAF_MSM'
+      # 这里指的是"这份 workflow 文件所在仓库"的哪个分支被 push 会触发它，
+      # 跟下面 checkout 步骤里 ref 指定"去哪里拉代码"是两回事。
+      # 如果你是把这份 workflow 放进自己 fork 的 NotZeetaa/android_kernel_xiaomi_sm8250
+      # 里（分支名照抄成 CAF_MSM），这里天然就是对的；如果是放在别的仓库/别的分支名，改成对应的名字。
 
 concurrency:
   group: kernel-build-${{ github.ref }}
@@ -30,7 +34,16 @@ env:
   KERNELSU: ${{ github.event.inputs.kernelsu || 'false' }}
   LOCALVERSION: ${{ github.event.inputs.localversion || 'selfbuild' }}
   OUT_DIR: out
-  # 不再用 proton-clang，改用官方 AOSP 内核构建用的 clang 快照。
+  # 内核源码：NotZeetaa/android_kernel_xiaomi_sm8250 的 CAF_MSM 分支。
+  # 已经和之前用的 de1sek/yarpiin_kernel_xiaomi_sm8250 逐项核对过源码：
+  # build.config.common / build.config.aarch64 完全一致（同样 BRANCH=android-4.19-stable，
+  # 同样写死 clang-r399163b，同样 CROSS_COMPILE_COMPAT=arm-linux-gnueabi-），
+  # vdso32/Makefile 的 --prefix= 那一行、camera_v2 的 gcc-version.sh 调用、
+  # lib/string.c 的 stpcpy 实现也都一样。所以下面工具链拉取/校验的部分不用改，
+  # 跟之前那份是同一套。
+  KERNEL_REPO: NotZeetaa/android_kernel_xiaomi_sm8250
+  KERNEL_REF: CAF_MSM
+  # 不用 proton-clang，改用官方 AOSP 内核构建用的 clang 快照。
   # build.config.common 里写死的是 clang-r399163b；
   # master-kernel-build-2021 分支是 Google 官方仓库里专门给这个时期内核构建用的分支。
   CLANG_DIR: /opt/clang-official
@@ -52,11 +65,23 @@ jobs:
                       /opt/hostedtoolcache/CodeQL 2>/dev/null || true
           sudo docker image prune -af 2>/dev/null || true
           df -h
-      - name: 检出内核源码
+
+      - name: 检出内核源码 (NotZeetaa/android_kernel_xiaomi_sm8250, CAF_MSM 分支)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_REF }}
+          # 如果这份 workflow 文件本身就直接放在你 fork 的 NotZeetaa 仓库里跑，
+          # 上面这两行 repository/ref 删掉也没事，默认就是当前仓库当前分支；
+          # 留着的好处是不管这份 workflow 放在哪个仓库里，源码永远固定拉这一份。
+          fetch-depth: 1
+          # 之前是 0（拉全部分支 + 全部历史，一个内核仓库单是一个 commit 的量
+          # 打包下来就有 200 多 MB，全历史只会更大）。这份 defconfig 没开
+          # CONFIG_LOCALVERSION_AUTO，LOCALVERSION 也是靠下面那一步手动写入的，
+          # 完全不需要 git 历史，改成 1 只拉最新一个 commit，省掉大头的 checkout 时间。
           submodules: recursive
+          # 这份源码根目录没有 .gitmodules，目前是空操作、不产生耗时，
+          # 保留是为了以后万一加了子模块也不用回来改这里。
 
       - name: 安装编译依赖
         run: |
@@ -69,20 +94,21 @@ jobs:
             binutils-arm-linux-gnueabi
           # 说明：binutils-arm-linux-gnueabi 是专门为了补上 arm-linux-gnueabi-ld。
           # 内核编译 32 位兼容 vDSO（vdso32）那一步是 Makefile 里硬编码直接调用
-          # $(CROSS_COMPILE_ARM32)ld（即 arm-linux-gnueabi-ld），不走我们 make 时
-          # 显式指定的 LD=ld.lld。而我们目前用的两套官方工具链里都没有这个文件：
-          # prebuilts/gas/linux-x86 官方 README 写明该仓库只含 as 和 elfedit，
-          # 没有 ld；官方 clang 包自带的也只是 ld.lld，不是这个交叉版 GNU ld。
-          # 所以这里用 apt 装一个真正的 GNU binutils 来补这一个缺口，
+          # $(CROSS_COMPILE_COMPAT)ld（即 arm-linux-gnueabi-ld），不走我们 make 时
+          # 显式指定的 LD=ld.lld。而我们用的两套官方工具链里都没有这个文件：
+          # prebuilts/gas/linux-x86 官方仓库只含 as 和 elfedit，没有 ld；
+          # 官方 clang 包自带的也只是 ld.lld，不是这个交叉版 GNU ld。
+          # 所以用 apt 装一个真正的 GNU binutils 来补这一个缺口，
           # 其余的 AR/NM/OBJCOPY/OBJDUMP/STRIP 仍然显式指向 LLVM 工具，不受影响。
+
       - name: 缓存 ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ env.DEVICE }}-${{ github.sha }}
+          key: ccache-${{ env.DEVICE }}-${{ env.KERNEL_REF }}-${{ github.sha }}
           restore-keys: |
-            ccache-${{ env.DEVICE }}-
-      # 缓存 key 换成新工具链的标识，避免复用到 proton-clang 时代的缓存
+            ccache-${{ env.DEVICE }}-${{ env.KERNEL_REF }}-
+
       - name: 缓存官方 Clang 工具链
         id: clang-cache
         uses: actions/cache@v4
@@ -90,7 +116,6 @@ jobs:
           path: ${{ env.CLANG_DIR }}
           key: official-clang-r399163b-v1
 
-      # 把拉取源从 kdrag0n/proton-clang 换成 Google 官方仓库的 master-kernel-build-2021 分支
       - name: 拉取官方 Clang（clang-r399163b，master-kernel-build-2021 分支）
         if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
@@ -98,17 +123,6 @@ jobs:
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
             "${{ env.CLANG_DIR }}"
 
-      # 修复关键点：prebuilts/clang/host/linux-x86 这个仓库是按版本号分子目录存放的
-      # （例如 clang-r399163b/bin/clang），克隆下来的根目录本身没有 bin/ 这一层，
-      # 而且 master-kernel-build-2021 这个分支下同时存在好几个版本目录
-      # （clang-r399163b、clang-r416183b、clang-r416183c、clang-r383902、
-      # clang-stable、clang-3289846……）。
-      # 之前用 find + head -n1 去猜路径，一是 -maxdepth 2 不够深（bin/clang 文件
-      # 本身在第 3 层，永远搜不到），二是就算深度改对了，多个版本目录同时存在时
-      # 猜中哪个版本也是不确定的。这里改成直接拼接 CLANG_VERSION 指定的路径，
-      # 再校验它是否真的存在，确定性更强，出错报的信息也更明确。
-      # 这一步不依赖 cache-hit 条件，无论是刚拉取还是命中缓存都会执行，
-      # 结果写入 GITHUB_ENV，后面统一引用 $CLANG_BIN_DIR。
       - name: 定位官方 Clang 实际的 bin 目录
         run: |
           CLANG_BIN_DIR="${{ env.CLANG_DIR }}/${{ env.CLANG_VERSION }}/bin"
@@ -134,10 +148,10 @@ jobs:
           git clone --depth=1 \
             https://android.googlesource.com/platform/prebuilts/gas/linux-x86 \
             "${{ env.GAS_DIR }}" || echo "::warning::gas 兜底工具拉取失败，不影响主流程，继续执行"
-      # prebuilts/gas/linux-x86 这个仓库的二进制是直接放在仓库根目录的
-      # （aarch64-linux-gnu-as / arm-linux-gnueabi-as 等），没有 bin/ 这一层子目录，
-      # 和 clang 仓库的结构不一样，这里直接把 $GAS_DIR 本身加进 PATH 即可，
-      # 日志已验证这部分是正常工作的。
+          # prebuilts/gas/linux-x86 这个仓库的二进制直接放在仓库根目录
+          # （aarch64-linux-gnu-as / arm-linux-gnueabi-as 等），没有 bin/ 这一层子目录，
+          # 和 clang 仓库的结构不一样，下面直接把 $GAS_DIR 本身加进 PATH 即可。
+
       - name: 注册工具链到 PATH 并校验
         run: |
           echo "$CLANG_BIN_DIR" >> "$GITHUB_PATH"
@@ -150,16 +164,17 @@ jobs:
           echo "== 校验是否命中 r399163b（如果没匹配到，说明用错了 clang，直接失败而不是继续跑）=="
           clang --version | grep -q "399163" && echo "OK: 版本匹配 clang-r399163b" \
             || { echo "::error::clang --version 输出里没找到 399163 字样，说明 PATH 没有正确指向官方 clang（很可能又落到系统自带的 clang 了），停止构建。"; exit 1; }
-          echo "== ld.lld --version（改用 LLVM 自带链接器，不再依赖 proton-clang 自带的 GNU ld）=="
+          echo "== ld.lld --version（改用 LLVM 自带链接器）=="
           ld.lld --version || { echo "::error::ld.lld 不存在，检查 CLANG_BIN_DIR 是否指向正确的官方 clang bin 目录"; exit 1; }
           echo "== llvm-objdump --version =="
           llvm-objdump --version || { echo "::error::llvm-objdump 不存在，检查 CLANG_BIN_DIR 是否指向正确的官方 clang bin 目录"; exit 1; }
-          echo "== aarch64-linux-gnu-as --version（来自 prebuilts/gas/linux-x86，路径已修正）=="
+          echo "== aarch64-linux-gnu-as --version（来自 prebuilts/gas/linux-x86）=="
           aarch64-linux-gnu-as --version | head -n1
           echo "== arm-linux-gnueabi-as --version（32位兼容部分用的交叉汇编器）=="
           arm-linux-gnueabi-as --version | head -n1
           echo "== arm-linux-gnueabi-ld --version（vdso32 链接阶段硬编码调用，来自 apt 装的 binutils-arm-linux-gnueabi，不是官方两套工具链里的东西）=="
           arm-linux-gnueabi-ld --version | head -n1 || { echo "::error::arm-linux-gnueabi-ld 不存在，检查 binutils-arm-linux-gnueabi 是否装成功"; exit 1; }
+
       - name: 定位 ${{ env.DEVICE }} 的 defconfig（自动搜索，不写死路径）
         id: defconfig
         run: |
@@ -172,19 +187,22 @@ jobs:
           fi
           RELCFG="$(realpath --relative-to=arch/arm64/configs "$FOUND")"
           echo "命中: $FOUND  ->  make 目标名: $RELCFG"
+          # 注：这份 NotZeetaa 源码里 thyme_defconfig 实际放在 arch/arm64/configs/vendor/
+          # 下面（跟之前那份不带 vendor/ 子目录不一样）。find 是递归查找、RELCFG 是
+          # 算出来的相对路径，两种目录结构都能正确处理，不用为这个改代码，已经验证过。
           echo "path=$FOUND"   >> "$GITHUB_OUTPUT"
           echo "target=$RELCFG" >> "$GITHUB_OUTPUT"
+
       - name: 追加自定义 LOCALVERSION（默认非空，避免版本号和官方固件撞车）
         if: ${{ env.LOCALVERSION != '' }}
         run: |
           echo 'CONFIG_LOCALVERSION="-${{ env.LOCALVERSION }}"' >> "${{ steps.defconfig.outputs.path }}"
+
       - name: 集成 KernelSU（可选，需在生成 .config 之前注入源码树）
         if: ${{ env.KERNELSU == 'true' }}
         run: |
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
-      # 这一步是专门为兼容 proton-clang 之类的新版第三方 clang 打的补丁。
-      # 换回官方 clang-r399163b 后大概率不再需要，但保留这一步是安全的——
-      # 它会先检测 Makefile 是否已经是"修复过的写法"，命中就跳过，不会重复打坏。
+
       - name: 修补 vdso32 --prefix=（仅在需要时生效，用官方工具链一般会被跳过）
         run: |
           F="arch/arm64/kernel/vdso32/Makefile"
@@ -194,10 +212,7 @@ jobs:
             sed -i 's/--prefix=\$(COMPAT_GCC_TOOLCHAIN_DIR)$/--prefix=$(COMPAT_GCC_TOOLCHAIN_DIR)$(notdir $(CROSS_COMPILE_COMPAT))/' "$F"
             grep -n -- '--prefix=' "$F"
           fi
-      # make 命令里加上 LD/AR/NM/OBJCOPY/OBJDUMP/STRIP 显式指向 LLVM 自带工具，
-      # 而不是让 CROSS_COMPILE 前缀去找 PATH 里第一个同名的 GNU 工具（那样很容易又混进第三方 binutils）。
-      # AS 没有显式指定，走 CROSS_COMPILE 前缀，PATH 里能正确找到 prebuilts/gas/linux-x86 提供的
-      # aarch64-linux-gnu-as / arm-linux-gnueabi-as。
+
       - name: 生成 .config
         run: |
           export PATH="$CLANG_BIN_DIR:${{ env.GAS_DIR }}:$PATH"
@@ -215,6 +230,7 @@ jobs:
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             ${{ steps.defconfig.outputs.target }}
+
       - name: 若启用 KernelSU，则在 .config 中打开对应选项
         if: ${{ env.KERNELSU == 'true' }}
         run: |
@@ -234,6 +250,7 @@ jobs:
             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             olddefconfig
+
       - name: 编译内核（目标 Image.gz，会连带生成 Image）
         run: |
           export PATH="$CLANG_BIN_DIR:${{ env.GAS_DIR }}:$PATH"
@@ -253,6 +270,7 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             Image.gz \
             2>&1 | tee build.log
+
       - name: 校验产物
         run: |
           IMG="${{ env.OUT_DIR }}/arch/arm64/boot/Image"
@@ -264,6 +282,7 @@ jobs:
           fi
           echo "已生成:"
           ls -la "$IMG" "$IMGGZ"
+
       - name: 上传编译日志
         if: always()
         uses: actions/upload-artifact@v4
