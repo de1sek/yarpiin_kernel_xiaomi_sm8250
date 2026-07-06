@@ -81,9 +81,14 @@ jobs:
 
       - name: 设置工具链路径
         run: |
-          CLANG_BIN_DIR="${{ env.CLANG_DIR }}/${{ env.CLANG_VERSION }}/bin"
+          # 注意：AOSP 该仓库内各版本目录均带 "clang-" 前缀，
+          # 例如 clang-r416183b，而非单纯的 r416183b，
+          # 此前未加前缀导致路径拼接错误、找不到 clang 可执行文件。
+          CLANG_BIN_DIR="${{ env.CLANG_DIR }}/clang-${{ env.CLANG_VERSION }}/bin"
           if [ ! -x "$CLANG_BIN_DIR/clang" ]; then
-            echo "::error::Clang ${{ env.CLANG_VERSION }} 未找到"
+            echo "::error::Clang clang-${{ env.CLANG_VERSION }} 未找到，请检查版本号或仓库目录结构"
+            echo "已存在的目录列表："
+            ls -la "${{ env.CLANG_DIR }}" || true
             exit 1
           fi
           echo "CLANG_BIN_DIR=$CLANG_BIN_DIR" >> "$GITHUB_ENV"
