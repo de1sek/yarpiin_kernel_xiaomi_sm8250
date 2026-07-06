@@ -32,7 +32,8 @@ env:
   KERNEL_REPO: NotZeetaa/android_kernel_xiaomi_sm8250
   KERNEL_REF: CAF_MSM
   CLANG_DIR: /opt/clang-official
-  GAS_DIR: /opt/gas-official
+  # 32 位兼容工具链前缀（vdso32 需要），与 CROSS_COMPILE_COMPAT 保持一致即可
+  CROSS_COMPILE_ARM32: arm-linux-gnueabi-
 
 jobs:
   build:
@@ -67,7 +68,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
+          # 精确 key 按 commit 区分；restore-keys 兜底，
+          # 即使当前 commit 没有缓存，也能复用上一次最接近的缓存做增量编译，
+          # 否则每个新 commit 的 ccache 都是空的，起不到加速效果。
           key: ccache-${{ env.DEVICE }}-lse-${{ env.CLANG_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ env.DEVICE }}-lse-${{ env.CLANG_VERSION }}-
 
       - name: 缓存 Clang 工具链
         id: clang-cache
@@ -97,7 +103,6 @@ jobs:
           fi
           echo "CLANG_BIN_DIR=$CLANG_BIN_DIR" >> "$GITHUB_ENV"
           echo "$CLANG_BIN_DIR" >> "$GITHUB_PATH"
-          echo "${{ env.GAS_DIR }}" >> "$GITHUB_PATH"
 
       - name: 校验工具链
         run: |
@@ -116,17 +121,25 @@ jobs:
           echo "path=$FOUND" >> "$GITHUB_OUTPUT"
           echo "target=$RELCFG" >> "$GITHUB_OUTPUT"
 
-      - name: 配置 defconfig（保留 LSE）
+      - name: 配置 defconfig（追加版本后缀）
         run: |
           echo 'CONFIG_LOCALVERSION="-${{ env.LOCALVERSION }}"' >> "${{ steps.defconfig.outputs.path }}"
-          echo 'CONFIG_ARM64_LSE_ATOMICS=y' >> "${{ steps.defconfig.outputs.path }}"
-          echo "✅ 已保留 CONFIG_ARM64_LSE_ATOMICS=y"
+          # CONFIG_ARM64_LSE_ATOMICS 在该 defconfig 中已经是 y，
+          # 不再重复追加（避免多余的 "override: reassigning" 警告）。
+          # 这里只做只读校验，确认没有被后续改动意外关掉。
+          if grep -q '^CONFIG_ARM64_LSE_ATOMICS=y' "${{ steps.defconfig.outputs.path }}"; then
+            echo "✅ 确认 defconfig 中 CONFIG_ARM64_LSE_ATOMICS=y"
+          else
+            echo "::warning::defconfig 中未找到 CONFIG_ARM64_LSE_ATOMICS=y，请确认是否符合预期"
+          fi
 
       - name: 生成 .config
         run: |
           make -j$(nproc) ARCH=arm64 O=${{ env.OUT_DIR }} \
             CC="ccache clang" LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=${{ env.CROSS_COMPILE_ARM32 }} \
+            CROSS_COMPILE_ARM32=${{ env.CROSS_COMPILE_ARM32 }} \
             ${{ steps.defconfig.outputs.target }}
 
       - name: 编译内核
@@ -134,7 +147,9 @@ jobs:
           set -o pipefail
           make -j$(nproc) ARCH=arm64 O=${{ env.OUT_DIR }} \
             CC="ccache clang" LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=${{ env.CROSS_COMPILE_ARM32 }} \
+            CROSS_COMPILE_ARM32=${{ env.CROSS_COMPILE_ARM32 }} \
             Image.gz 2>&1 | tee build.log
 
       - name: 校验产物
