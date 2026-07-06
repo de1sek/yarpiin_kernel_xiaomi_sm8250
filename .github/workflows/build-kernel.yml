@@ -79,9 +79,20 @@ jobs:
           # 打包下来就有 200 多 MB，全历史只会更大）。这份 defconfig 没开
           # CONFIG_LOCALVERSION_AUTO，LOCALVERSION 也是靠下面那一步手动写入的，
           # 完全不需要 git 历史，改成 1 只拉最新一个 commit，省掉大头的 checkout 时间。
-          submodules: recursive
-          # 这份源码根目录没有 .gitmodules，目前是空操作、不产生耗时，
-          # 保留是为了以后万一加了子模块也不用回来改这里。
+          submodules: false
+          # 上一版这里写的是 recursive，看着"没有 .gitmodules 所以是空操作"这个判断
+          # 是不完整的——.gitmodules 不存在，不代表树里没有子模块引用。
+          # 用 git ls-tree -r HEAD 实测发现 .circleci/AnyKernel 是一个 mode 160000
+          # 的 gitlink（提交号 a3641a06915caf76b07c8b71f624aa3529bf131e），但当前
+          # commit 里根本没有 .gitmodules 文件去说明它的地址——这是历史上加过
+          # 子模块、后来 .gitmodules 被删掉但 gitlink 条目没清干净留下的孤儿引用。
+          # de1sek 那份树没有这个问题（没有任何 160000 条目），是 NotZeetaa 这份
+          # 独有的。actions/checkout 设成 recursive 时会跑
+          # git submodule update --init --recursive，遇到这个孤儿 gitlink 直接
+          # fatal 退出（exit 128），导致整个 checkout 步骤失败、后面所有步骤被跳过——
+          # 这正是你上一次跑出来那份日志里的报错。
+          # .circleci/AnyKernel 本来也只是原作者自己 CircleCI 流程打包 AnyKernel3
+          # 用的模板，跟内核编译本身无关，我们的 workflow 不需要它，直接关掉子模块拉取即可。
 
       - name: 安装编译依赖
         run: |
