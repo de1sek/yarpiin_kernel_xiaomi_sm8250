@@ -55,9 +55,13 @@ jobs:
       - name: 安装编译依赖
         run: |
           sudo apt-get update
+          # 注意：CROSS_COMPILE=aarch64-linux-gnu- 需要 binutils-aarch64-linux-gnu
+          # 提供 aarch64-linux-gnu-as / aarch64-linux-gnu-objdump 等工具；
+          # 此前只装了 32 位兼容用的 binutils-arm-linux-gnueabi，
+          # 导致 vdso 汇编阶段回退到宿主机 x86 版 as，报 "unrecognized option '-EL'"。
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev build-essential \
             kmod cpio rsync git curl ca-certificates python3 python-is-python3 ccache \
-            binutils-arm-linux-gnueabi
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
       - name: 缓存 ccache
         uses: actions/cache@v4
